@@ -6,7 +6,7 @@ from garminconnect import (
     GarminConnectTooManyRequestsError,
 )
 
-from . import auth, db, sync
+from . import auth, db, sync, whoop
 
 
 def _login(_args) -> None:
@@ -42,6 +42,28 @@ def _status(_args) -> None:
         print(f"{kind:20} {n:5} days  {first} → {last}")
     (n_act,) = conn.execute("SELECT COUNT(*) FROM activities").fetchone()
     print(f"{'activities':20} {n_act:5}")
+    for kind, n, first, last in conn.execute(
+        "SELECT kind, COUNT(*), MIN(date(start_local)), MAX(date(start_local)) FROM whoop_raw GROUP BY kind ORDER BY kind"
+    ):
+        print(f"{'whoop ' + kind:20} {n:5}       {first} → {last}")
+
+
+def _whoop_login(_args) -> None:
+    try:
+        whoop.login_interactive()
+    except whoop.WhoopAuthError as exc:
+        sys.exit(str(exc))
+    print(f"Connected to WHOOP. Tokens saved to {whoop.TOKEN_PATH}.")
+
+
+def _whoop_sync(args) -> None:
+    conn = db.connect()
+    print(f"Syncing {args.days} days of WHOOP data into {db.DEFAULT_DB_PATH}")
+    try:
+        counts = whoop.sync(whoop.Client(), conn, args.days)
+    except (whoop.WhoopAuthError, whoop.WhoopRateLimited) as exc:
+        sys.exit(str(exc))
+    print(f"WHOOP: {counts}.")
 
 
 def _mcp(_args) -> None:
@@ -57,6 +79,10 @@ def main() -> None:
     sync_cmd = commands.add_parser("sync", help="pull data into SQLite")
     sync_cmd.add_argument("--days", type=int, default=30)
     sync_cmd.set_defaults(run=_sync)
+    commands.add_parser("whoop-login", help="connect your WHOOP account (OAuth)").set_defaults(run=_whoop_login)
+    whoop_cmd = commands.add_parser("whoop-sync", help="pull WHOOP data into SQLite")
+    whoop_cmd.add_argument("--days", type=int, default=30)
+    whoop_cmd.set_defaults(run=_whoop_sync)
     commands.add_parser("status", help="show what's stored").set_defaults(run=_status)
     commands.add_parser("mcp", help="run the MCP server for Claude (stdio)").set_defaults(run=_mcp)
     args = parser.parse_args()

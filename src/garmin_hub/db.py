@@ -3,7 +3,7 @@
 import json
 import os
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 DEFAULT_DB_PATH = Path(os.getenv("GARMIN_HUB_DB", Path(__file__).resolve().parents[2] / "data" / "garmin.db"))
@@ -22,6 +22,15 @@ CREATE TABLE IF NOT EXISTS activities (
     activity_type TEXT,
     payload TEXT NOT NULL,
     fetched_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS whoop_raw (
+    kind TEXT NOT NULL,
+    record_id TEXT NOT NULL,
+    start_local TEXT,
+    end_local TEXT,
+    payload TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    PRIMARY KEY (kind, record_id)
 );
 """
 
@@ -70,4 +79,28 @@ def save_activity(conn: sqlite3.Connection, activity: dict) -> None:
             json.dumps(activity),
             _now(),
         ),
+    )
+
+
+def _local(timestamp: str | None, offset: str | None) -> str | None:
+    """WHOOP times are UTC plus a timezone_offset like "-04:00"; return local "YYYY-MM-DD HH:MM:SS"."""
+    if not timestamp:
+        return None
+    moment = datetime.fromisoformat(timestamp)
+    if offset:
+        sign = -1 if offset.startswith("-") else 1
+        hours, minutes = offset.lstrip("+-").split(":")
+        moment = moment + sign * timedelta(hours=int(hours), minutes=int(minutes))
+    return moment.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def save_whoop(conn: sqlite3.Connection, kind: str, record: dict) -> None:
+    # Recovery has no id of its own; it belongs to exactly one sleep.
+    record_id = str(record.get("id") or record["sleep_id"])
+    offset = record.get("timezone_offset")
+    conn.execute(
+        "INSERT OR REPLACE INTO whoop_raw (kind, record_id, start_local, end_local, payload, fetched_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (kind, record_id, _local(record.get("start"), offset), _local(record.get("end"), offset),
+         json.dumps(record), _now()),
     )

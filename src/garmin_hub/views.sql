@@ -78,3 +78,86 @@ SELECT k.day,
 FROM k LEFT JOIN acts USING (day)
 WHERE json_extract(s, '$.totalSteps') IS NOT NULL
 ORDER BY k.day;
+
+-- WHOOP: one row per main (non-nap) sleep, keyed by the day you woke up, so it lines up with `daily`.
+DROP VIEW IF EXISTS bands;
+DROP VIEW IF EXISTS whoop_daily;
+DROP VIEW IF EXISTS whoop_workouts;
+CREATE VIEW whoop_daily AS
+WITH s AS (
+    SELECT record_id AS sleep_id, start_local, end_local, payload AS p
+    FROM whoop_raw
+    WHERE kind = 'sleep' AND NOT COALESCE(json_extract(payload, '$.nap'), 0)
+      AND json_extract(payload, '$.score_state') = 'SCORED'
+), r AS (
+    SELECT record_id AS sleep_id, payload AS p FROM whoop_raw WHERE kind = 'recovery'
+), c AS (
+    SELECT record_id AS cycle_id, payload AS p FROM whoop_raw WHERE kind = 'cycle'
+), ranked AS (
+    -- If two main sleeps end on the same day, keep the longer one.
+    SELECT s.*, ROW_NUMBER() OVER (
+        PARTITION BY date(s.end_local)
+        ORDER BY json_extract(s.p, '$.score.stage_summary.total_in_bed_time_milli') DESC
+    ) AS n
+    FROM s
+)
+SELECT date(ranked.end_local) AS day,
+    json_extract(r.p, '$.score.recovery_score') AS recovery,
+    ROUND(json_extract(r.p, '$.score.hrv_rmssd_milli'), 1) AS hrv,
+    json_extract(r.p, '$.score.resting_heart_rate') AS resting_hr,
+    json_extract(r.p, '$.score.spo2_percentage') AS spo2,
+    json_extract(r.p, '$.score.skin_temp_celsius') AS skin_temp_c,
+    json_extract(r.p, '$.score.user_calibrating') AS calibrating,
+    ROUND((json_extract(ranked.p, '$.score.stage_summary.total_in_bed_time_milli')
+         - json_extract(ranked.p, '$.score.stage_summary.total_awake_time_milli')) / 3600000.0, 2) AS sleep_h,
+    ROUND(json_extract(ranked.p, '$.score.stage_summary.total_slow_wave_sleep_time_milli') / 60000.0) AS deep_min,
+    ROUND(json_extract(ranked.p, '$.score.stage_summary.total_rem_sleep_time_milli') / 60000.0) AS rem_min,
+    json_extract(ranked.p, '$.score.sleep_performance_percentage') AS sleep_performance,
+    json_extract(ranked.p, '$.score.sleep_efficiency_percentage') AS sleep_efficiency,
+    ROUND(json_extract(ranked.p, '$.score.respiratory_rate'), 1) AS respiratory_rate,
+    time(ranked.start_local) AS bedtime,
+    time(ranked.end_local) AS wake_time,
+    ROUND(json_extract(c.p, '$.score.strain'), 1) AS day_strain,
+    -- NULL = clean. Leave flagged days out of averages and correlations.
+    NULLIF(trim(
+        CASE WHEN json_extract(r.p, '$.score.user_calibrating') THEN 'calibrating ' ELSE '' END ||
+        CASE WHEN r.p IS NULL OR json_extract(r.p, '$.score_state') <> 'SCORED' THEN 'no_recovery ' ELSE '' END ||
+        CASE WHEN (json_extract(ranked.p, '$.score.stage_summary.total_in_bed_time_milli')
+                 - json_extract(ranked.p, '$.score.stage_summary.total_awake_time_milli')) < 4 * 3600000
+             THEN 'sleep_short ' ELSE '' END
+    ), '') AS quality_flags
+FROM ranked
+LEFT JOIN r USING (sleep_id)
+LEFT JOIN c ON c.cycle_id = CAST(json_extract(ranked.p, '$.cycle_id') AS TEXT)
+WHERE ranked.n = 1
+ORDER BY day;
+
+CREATE VIEW whoop_workouts AS
+SELECT record_id AS workout_id, start_local,
+    json_extract(payload, '$.sport_name') AS sport,
+    ROUND((julianday(end_local) - julianday(start_local)) * 1440) AS minutes,
+    json_extract(payload, '$.score.average_heart_rate') AS avg_hr,
+    json_extract(payload, '$.score.max_heart_rate') AS max_hr,
+    ROUND(json_extract(payload, '$.score.strain'), 1) AS strain,
+    ROUND(json_extract(payload, '$.score.kilojoule') / 4.184) AS kcal,
+    json_extract(payload, '$.score.percent_recorded') AS percent_recorded,
+    CASE
+        WHEN (julianday(end_local) - julianday(start_local)) * 1440 < 3 THEN 'empty'
+        WHEN json_extract(payload, '$.score.max_heart_rate') >= 200 THEN 'hr_artifact'
+        WHEN json_extract(payload, '$.score.percent_recorded') < 80 THEN 'partial_recording'
+    END AS quality_flag
+FROM whoop_raw WHERE kind = 'workout' AND json_extract(payload, '$.score_state') = 'SCORED';
+
+-- Garmin and WHOOP side by side for the same night. Different algorithms: compare direction, not raw values.
+CREATE VIEW bands AS
+SELECT day,
+    g.hrv AS garmin_hrv, w.hrv AS whoop_hrv,
+    g.resting_hr AS garmin_rhr, w.resting_hr AS whoop_rhr,
+    g.sleep_h AS garmin_sleep_h, w.sleep_h AS whoop_sleep_h,
+    g.deep_min AS garmin_deep_min, w.deep_min AS whoop_deep_min,
+    g.rem_min AS garmin_rem_min, w.rem_min AS whoop_rem_min,
+    g.readiness AS garmin_readiness, w.recovery AS whoop_recovery,
+    g.bedtime AS garmin_bedtime, w.bedtime AS whoop_bedtime,
+    g.quality_flags AS garmin_flags, w.quality_flags AS whoop_flags
+FROM daily g JOIN whoop_daily w USING (day)
+ORDER BY day;
