@@ -1,7 +1,7 @@
 [project]
 name = "garmin-hub"
 version = "0.1.0"
-description = "Pull your Garmin Connect data into SQLite, flag wrist-sensor errors, and query it from Claude over MCP"
+description = "Pull your Garmin and WHOOP data into SQLite, flag wrist-sensor errors, and query it from Claude over MCP"
 readme = "README.md"
 authors = [
     { name = "Eliot Brown", email = "eliotb26@gmail.com" }
